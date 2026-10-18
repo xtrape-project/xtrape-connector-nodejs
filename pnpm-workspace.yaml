@@ -1,0 +1,13 @@
+packages:
+  - "."
+
+# Own-registry packages are always freshly published; pnpm 11's default
+# release-age supply-chain gate must not block them.
+minimumReleaseAgeExclude:
+  - "@xtrape/*"
+
+allowBuilds:
+  esbuild: true
+
+onlyBuiltDependencies:
+  - esbuild

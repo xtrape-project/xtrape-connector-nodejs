@@ -1,0 +1,69 @@
+{
+  "name": "@xtrape/connector",
+  "version": "0.8.7",
+  "description": "Node.js Connector SDK for reporting Workers to the Xtrape control plane.",
+  "keywords": [
+    "xtrape",
+    "worker",
+    "panel",
+    "connector-sdk",
+    "automation",
+    "control-plane"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://forgejo.xtrape.com/xtrape-project/xtrape-connector-nodejs.git"
+  },
+  "homepage": "https://forgejo.xtrape.com/xtrape-project/xtrape-connector-nodejs#readme",
+  "bugs": {
+    "url": "https://forgejo.xtrape.com/xtrape-project/xtrape-connector-nodejs/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts",
+    "prepack": "pnpm build",
+    "test": "vitest run && node --test tests/publish-summarize.check.mjs",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.type-tests.json",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@xtrape/contracts": "^0.8.17"
+  },
+  "devDependencies": {
+    "@secretlint/secretlint-rule-preset-recommend": "13.0.2",
+    "@types/node": "^22.10.2",
+    "secretlint": "13.0.2",
+    "tsup": "^8.3.5",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.9"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "license": "Apache-2.0",
+  "pnpm": {
+    "overrides": {
+      "fast-uri@<3.1.7": "^3.1.7"
+    }
+  }
+}

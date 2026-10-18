@@ -1,0 +1,339 @@
+name: Publish npm package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, e.g. 0.3.0-rc.1 or 0.3.0"
+        required: true
+        type: string
+      dist_tag:
+        description: "npm dist-tag, e.g. next or latest"
+        required: true
+        default: "next"
+        type: choice
+        options:
+          - next
+          - latest
+      dry_run:
+        description: "Verify the full chain (pack, credentials, registry state) without publishing"
+        required: false
+        default: false
+        type: boolean
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+  # Failure diagnostics are posted to the publish-chain tracking issue #58
+  # (runner logs are not API-readable on this Forgejo instance).
+  issues: write
+
+concurrency:
+  group: npm-publish-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  NPMJS_REGISTRY: https://registry.npmjs.org/
+  FORGEJO_REGISTRY: https://forgejo.xtrape.com/api/packages/xtrape/npm/
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fail closed after an interrupted prior job on a persistent runner:
+          # remove predictable paths before recreating the private capture file.
+          rm -f \
+            "$RUNNER_TEMP/.npmrc-forgejo" \
+            "$RUNNER_TEMP/publish-out.txt" \
+            "$RUNNER_TEMP/payload.json" \
+            "$RUNNER_TEMP"/npmjs-error.* \
+            "$RUNNER_TEMP"/forgejo-error.*
+          umask 077
+          : > "$RUNNER_TEMP/publish-out.txt"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+          cache: "pnpm"
+
+      - name: Resolve release inputs
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            DIST_TAG="${{ inputs.dist_tag }}"
+            DRY_RUN="${{ inputs.dry_run }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+            DRY_RUN=false
+            if [[ "$VERSION" == *-* ]]; then
+              DIST_TAG="next"
+            else
+              DIST_TAG="latest"
+            fi
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=$DIST_TAG" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/publish-out.txt") 2>&1
+          pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/publish-out.txt") 2>&1
+          pnpm typecheck
+
+      - name: Test
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/publish-out.txt") 2>&1
+          pnpm test
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/publish-out.txt") 2>&1
+          pnpm build
+
+      - name: Assert the requested version matches package.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/publish-out.txt") 2>&1
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$PKG_VERSION" != "${{ steps.release.outputs.version }}" ]; then
+            echo "package.json is $PKG_VERSION but the release asks for ${{ steps.release.outputs.version }}" >&2
+            exit 1
+          fi
+
+      - name: Pack and verify tarball
+        id: pack
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/publish-out.txt") 2>&1
+          TARBALL="$(pnpm pack | tail -n 1)"
+          node scripts/verify-package-tarball.mjs "$TARBALL" "$VERSION" "XtrapeConnector,XtrapeAgent,serveCeService,CeLongPollLoop"
+          PACKAGE_NAME="$(node -p "require('./package.json').name")"
+          LOCAL_INTEGRITY="sha512-$(node -e "const { createHash } = require('node:crypto'); const { readFileSync } = require('node:fs'); process.stdout.write(createHash('sha512').update(readFileSync(process.argv[1])).digest('base64'));" "$TARBALL")"
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "package_name=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
+          echo "integrity=$LOCAL_INTEGRITY" >> "$GITHUB_OUTPUT"
+
+      - name: Configure Forgejo registry credentials
+        shell: bash
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          umask 077
+          FORGEJO_HOST_PATH="${FORGEJO_REGISTRY#https://}"
+          cat > "$RUNNER_TEMP/.npmrc-forgejo" <<EOF
+          @xtrape:registry=$FORGEJO_REGISTRY
+          //$FORGEJO_HOST_PATH:_authToken=$REGISTRY_TOKEN
+          always-auth=true
+          EOF
+          chmod 600 "$RUNNER_TEMP/.npmrc-forgejo"
+
+      - name: Verify npmjs credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/publish-out.txt") 2>&1
+          npm whoami --registry "$NPMJS_REGISTRY"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Verify Forgejo credentials
+        # Forgejo's npm registry API does not implement `/-/whoami` (verified:
+        # unconditional 404 — the structural cause of run 624). Probe the same
+        # credential against the Forgejo user API, an endpoint that exists.
+        shell: bash
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/publish-out.txt") 2>&1
+          STATUS="$(curl -sS --connect-timeout 15 --max-time 30 -o /dev/null -w "%{http_code}" -H "Authorization: token $REGISTRY_TOKEN" "${{ github.server_url }}/api/v1/user")" || STATUS="000"
+          if [ "$STATUS" != "200" ]; then
+            echo "Forgejo auth probe failed: HTTP $STATUS" >&2
+            exit 1
+          fi
+
+      - name: Check npmjs target version
+        id: npmjs
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PACKAGE_NAME: ${{ steps.pack.outputs.package_name }}
+          VERSION: ${{ steps.release.outputs.version }}
+          LOCAL_INTEGRITY: ${{ steps.pack.outputs.integrity }}
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/publish-out.txt") 2>&1
+          ERROR_FILE="$(mktemp "$RUNNER_TEMP/npmjs-error.XXXXXX")"
+          trap 'rm -f "$ERROR_FILE"' EXIT
+          if REMOTE_INTEGRITY="$(npm view "$PACKAGE_NAME@$VERSION" dist.integrity --registry "$NPMJS_REGISTRY" 2>"$ERROR_FILE")"; then
+            if [ "$REMOTE_INTEGRITY" != "$LOCAL_INTEGRITY" ]; then
+              echo "npmjs already has $PACKAGE_NAME@$VERSION with different tarball integrity" >&2
+              echo "remote: $REMOTE_INTEGRITY" >&2
+              echo "local:  $LOCAL_INTEGRITY" >&2
+              exit 1
+            fi
+            echo "npmjs already has the identical tarball; publish will be skipped"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif grep -Eq 'E404|404 Not Found' "$ERROR_FILE"; then
+            echo "npmjs does not have $PACKAGE_NAME@$VERSION"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            cat "$ERROR_FILE" >&2
+            exit 1
+          fi
+
+      - name: Check Forgejo target version
+        id: forgejo
+        shell: bash
+        env:
+          PACKAGE_NAME: ${{ steps.pack.outputs.package_name }}
+          VERSION: ${{ steps.release.outputs.version }}
+          LOCAL_INTEGRITY: ${{ steps.pack.outputs.integrity }}
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/publish-out.txt") 2>&1
+          ERROR_FILE="$(mktemp "$RUNNER_TEMP/forgejo-error.XXXXXX")"
+          trap 'rm -f "$ERROR_FILE"' EXIT
+          if REMOTE_INTEGRITY="$(npm view "$PACKAGE_NAME@$VERSION" dist.integrity --registry "$FORGEJO_REGISTRY" --userconfig "$RUNNER_TEMP/.npmrc-forgejo" 2>"$ERROR_FILE")"; then
+            if [ "$REMOTE_INTEGRITY" != "$LOCAL_INTEGRITY" ]; then
+              echo "Forgejo already has $PACKAGE_NAME@$VERSION with different tarball integrity" >&2
+              echo "remote: $REMOTE_INTEGRITY" >&2
+              echo "local:  $LOCAL_INTEGRITY" >&2
+              exit 1
+            fi
+            echo "Forgejo already has the identical tarball; publish will be skipped"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif grep -Eq 'E404|404 Not Found' "$ERROR_FILE"; then
+            echo "Forgejo does not have $PACKAGE_NAME@$VERSION"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            cat "$ERROR_FILE" >&2
+            exit 1
+          fi
+
+      - name: Publish the verified tarball to npmjs (canonical)
+        if: ${{ steps.release.outputs.dry_run != 'true' && steps.npmjs.outputs.exists != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/publish-out.txt") 2>&1
+          npm publish "./${{ steps.pack.outputs.tarball }}" --registry "$NPMJS_REGISTRY" --access public --tag "${{ steps.release.outputs.dist_tag }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish the same tarball to Forgejo (mirror)
+        if: ${{ steps.release.outputs.dry_run != 'true' && steps.forgejo.outputs.exists != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/publish-out.txt") 2>&1
+          npm publish "./${{ steps.pack.outputs.tarball }}" --registry "$FORGEJO_REGISTRY" --userconfig "$RUNNER_TEMP/.npmrc-forgejo" --access public --tag "${{ steps.release.outputs.dist_tag }}"
+
+      - name: Post-publish read-back gate (both registries must serve the identical tarball)
+        # A successful publish command is not proof that the registry serves
+        # the version. Poll each registry sequentially for up to ten minutes
+        # and require the exact integrity of the tarball packed above.
+        if: ${{ steps.release.outputs.dry_run != 'true' }}
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PACKAGE_NAME: ${{ steps.pack.outputs.package_name }}
+          VERSION: ${{ steps.release.outputs.version }}
+          LOCAL_INTEGRITY: ${{ steps.pack.outputs.integrity }}
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/publish-out.txt") 2>&1
+          poll() { # $1 label, $2.. npm view args
+            local label="$1"; shift
+            local i remote
+            for i in $(seq 1 30); do
+              if remote="$(npm view "$PACKAGE_NAME@$VERSION" dist.integrity "$@" 2>/dev/null)" && [ -n "$remote" ]; then
+                if [ "$remote" = "$LOCAL_INTEGRITY" ]; then
+                  echo "$label read-back verified on attempt $i"
+                  return 0
+                fi
+                echo "read-back gate failed: $label integrity mismatch" >&2
+                echo "detail: remote integrity differs from the packed tarball (values withheld from the issue; see this log)" >&2
+                return 1
+              fi
+              sleep 20
+            done
+            echo "read-back gate failed: $label not readable within the per-registry window" >&2
+            return 1
+          }
+          poll "npmjs" --registry "$NPMJS_REGISTRY"
+          poll "Forgejo" --registry "$FORGEJO_REGISTRY" --userconfig "$RUNNER_TEMP/.npmrc-forgejo"
+
+      - name: Dry-run notice
+        if: ${{ steps.release.outputs.dry_run == 'true' }}
+        run: echo "dry_run=true — build, tarball verification, both credential probes, and both registry-state checks passed; nothing was published."
+
+      - name: Report failure summary to the release issue (allowlisted + redacted)
+        # Same reviewed discipline as server-ce CI (#803/#807): only structured
+        # npm error codes / HTTP statuses / our own assertions leave the runner.
+        if: failure()
+        env:
+          CI_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          PUBLISH_OUTPUT_PATH="$RUNNER_TEMP/publish-out.txt" \
+          PUBLISH_PAYLOAD_PATH="$RUNNER_TEMP/payload.json" \
+            node .forgejo/workflows/publish-summarize.mjs
+          curl -sf -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data-binary "@$RUNNER_TEMP/payload.json" \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/issues/58/comments" || echo "diagnostic post failed"
+
+      - name: Cleanup publish credentials and diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f \
+            "$RUNNER_TEMP/.npmrc-forgejo" \
+            "$RUNNER_TEMP/publish-out.txt" \
+            "$RUNNER_TEMP/payload.json" \
+            "$RUNNER_TEMP"/npmjs-error.* \
+            "$RUNNER_TEMP"/forgejo-error.*

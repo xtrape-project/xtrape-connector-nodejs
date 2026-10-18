@@ -1,0 +1,171 @@
+name: Publish forwarding package (@xtrape/agent)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Verify the chain (pack, credentials, registry state) without publishing"
+        type: boolean
+        default: true
+
+concurrency:
+  group: npm-publish-forward
+  cancel-in-progress: false
+
+env:
+  NPMJS_REGISTRY: https://registry.npmjs.org/
+  FORGEJO_REGISTRY: https://forgejo.xtrape.com/api/packages/xtrape/npm/
+  PKG_DIR: compat/agent-forward
+
+jobs:
+  publish-forward:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Resolve package identity
+        id: meta
+        run: |
+          set -euo pipefail
+          NAME="$(node -p "require('./$PKG_DIR/package.json').name")"
+          VERSION="$(node -p "require('./$PKG_DIR/package.json').version")"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing $NAME@$VERSION (forwarder)"
+
+      - name: Engines sentinel (forward matches canonical)
+        run: |
+          set -euo pipefail
+          FWD="$(node -pe "require('./$PKG_DIR/package.json').engines?.node ?? ''")"
+          CANON="$(node -pe "require('./package.json').engines?.node ?? ''")"
+          if [ -z "$FWD" ] || [ "$FWD" != "$CANON" ]; then
+            echo "::error::forwarding engines.node ('$FWD') missing or differs from canonical ('$CANON')"
+            exit 1
+          fi
+          echo "engines sentinel ok: node $FWD"
+
+      - name: Smoke test (pack tarball, install, require + import)
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/$PKG_DIR"
+          SMOKE_TARBALL="$(npm pack --silent | tail -1)"
+          TMP="$RUNNER_TEMP/fwd-smoke"; mkdir -p "$TMP"; cd "$TMP"
+          npm init -y >/dev/null
+          npm install "$GITHUB_WORKSPACE/$PKG_DIR/$SMOKE_TARBALL" >/dev/null
+          node -e "const m=require('@xtrape/agent'); if(!m.XtrapeConnector||m.XtrapeAgent!==m.XtrapeConnector) throw new Error('CJS forward broken'); console.log('CJS ok')"
+          node --input-type=module -e "import * as m from '@xtrape/agent'; if(!m.XtrapeConnector) throw new Error('ESM forward broken'); console.log('ESM ok')"
+
+      - name: Pack
+        id: pack
+        run: |
+          set -euo pipefail
+          cd "$PKG_DIR"
+          PACK_JSON="$(npm pack --json)"
+          TARBALL="$(node -pe 'JSON.parse(process.argv[1])[0].filename' "$PACK_JSON")"
+          INTEGRITY="$(node -pe 'JSON.parse(process.argv[1])[0].integrity' "$PACK_JSON")"
+          echo "tarball=$PKG_DIR/$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "integrity=$INTEGRITY" >> "$GITHUB_OUTPUT"
+
+      - name: Verify npmjs credentials (runs in dry run too)
+        run: npm whoami --registry "$NPMJS_REGISTRY"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Verify Forgejo registry credentials (runs in dry run too)
+        # Measured behavior of this Forgejo instance (2026-07-26): the npm
+        # /-/whoami endpoint is NOT implemented (HTTP 404 with a VALID token)
+        # but its auth middleware still runs (HTTP 401 with an invalid token).
+        # 404-vs-401 is therefore a deterministic token-validity probe. In
+        # addition, anonymous reads are rejected instance-wide, so an
+        # authenticated metadata read of a private package proves the token
+        # authenticates with package read access on this org. No non-mutating
+        # interface proves package WRITE scope; that residual is enforced by
+        # the publish step itself, which fails loudly.
+        run: |
+          set -euo pipefail
+          umask 077
+          NPMRC="$RUNNER_TEMP/.npmrc-forgejo"
+          echo "//forgejo.xtrape.com/api/packages/xtrape/npm/:_authToken=${REGISTRY_TOKEN}" > "$NPMRC"
+          chmod 600 "$NPMRC"
+          CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: token ${REGISTRY_TOKEN}" "${FORGEJO_REGISTRY}-/whoami")"
+          if [ "$CODE" != "404" ]; then
+            echo "::error::Forgejo token-validity probe failed (whoami HTTP $CODE; expected 404-with-valid-token — 401/403 means the REGISTRY_TOKEN is invalid or expired)"
+            exit 1
+          fi
+          npm view "@xtrape/connector" version --registry "$FORGEJO_REGISTRY" --userconfig "$NPMRC" >/dev/null             || { echo "::error::authenticated package read failed — token lacks package read on this org"; exit 1; }
+          echo "Forgejo token: authenticated (write scope is provable only at publish; publish fails loudly on missing scope)"
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Registry state check (runs in dry run too; strict E404 semantics)
+        id: state
+        run: |
+          set -euo pipefail
+          NAME="${{ steps.meta.outputs.name }}"; VERSION="${{ steps.meta.outputs.version }}"; LOCAL="${{ steps.pack.outputs.integrity }}"
+          check() {
+            local label="$1" reg="$2"; shift 2
+            local ERR="$RUNNER_TEMP/view-$label.err" REMOTE
+            if REMOTE="$(npm view "$NAME@$VERSION" dist.integrity --registry "$reg" "$@" 2>"$ERR")"; then
+              if [ "$REMOTE" = "$LOCAL" ]; then
+                echo "$label: already published with IDENTICAL integrity — publish will idempotent-skip"
+                echo "exists_$label=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "::error::$label: $NAME@$VERSION exists with DIFFERENT integrity (remote=$REMOTE local=$LOCAL) — refusing"
+                exit 1
+              fi
+            elif grep -qE "E404|404 Not Found" "$ERR"; then
+              echo "$label: $NAME@$VERSION not present (explicit 404) — will publish"
+              echo "exists_$label=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::$label: registry state UNKNOWN — npm view failed without an explicit 404 (network/auth/5xx/rate-limit). Failing closed."
+              cat "$ERR" || true
+              exit 1
+            fi
+          }
+          check npmjs "$NPMJS_REGISTRY"
+          check forgejo "$FORGEJO_REGISTRY" --userconfig "$RUNNER_TEMP/.npmrc-forgejo"
+
+      - name: Publish to npmjs
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.state.outputs.exists_npmjs }}" = "true" ]; then
+            echo "already published on npmjs with identical integrity (verified by the state check) — idempotent skip"
+          else
+            npm publish "./${{ steps.pack.outputs.tarball }}" --registry "$NPMJS_REGISTRY" --access public --tag latest
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish to Forgejo registry
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          NPMRC="$RUNNER_TEMP/.npmrc-forgejo"
+          [ -f "$NPMRC" ] || { echo "::error::hardened .npmrc missing (credential step must run first)"; exit 1; }
+          if [ "${{ steps.state.outputs.exists_forgejo }}" = "true" ]; then
+            echo "already published on Forgejo with identical integrity (verified by the state check) — idempotent skip"
+          else
+            npm publish "./${{ steps.pack.outputs.tarball }}" --registry "$FORGEJO_REGISTRY" --userconfig "$NPMRC" --access public --tag latest
+          fi
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Deprecate old line on npmjs (best effort)
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          npm deprecate "@xtrape/agent@0.8.0" "Renamed to @xtrape/connector (Xtrape 0.8.0 concept freeze, agent-nodejs#75). This forwarding release re-exports @xtrape/connector; install @xtrape/connector directly." --registry "$NPMJS_REGISTRY" || echo "deprecate failed (non-fatal; rerun manually)"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Cleanup registry credentials
+        if: ${{ always() }}
+        run: rm -f "$RUNNER_TEMP/.npmrc-forgejo" "$RUNNER_TEMP"/view-*.err

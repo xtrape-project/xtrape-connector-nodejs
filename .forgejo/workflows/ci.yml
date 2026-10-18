@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: docker
+    container:
+      image: node:24-bookworm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.28.2 --activate
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+  dependency-audit:
+    runs-on: docker
+    needs: validate
+    container:
+      image: node:24-bookworm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.28.2 --activate
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Dependency audit (fail on high/critical in production deps)
+        # Pinned to the public advisory DB: the runner's inherited registry
+        # (internal mirror) has no audit endpoint, so an inherited registry
+        # fails this step on transport rather than on a real advisory.
+        run: pnpm audit --prod --audit-level=high --registry https://registry.npmjs.org/
+
+  secret-scan:
+    runs-on: docker
+    needs: dependency-audit
+    container:
+      image: node:24-bookworm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.28.2 --activate
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Secret scan (secretlint, git-tracked files)
+        # The scanner is a lockfile-pinned devDependency, never fetched ad hoc
+        # at run time: a supply-chain gate must not itself execute un-lockfiled
+        # remote code. Scans exactly the tracked files — the gate's question is
+        # "did a secret get committed?", and this avoids walking node_modules.
+        run: git ls-files -z | xargs -0 pnpm exec secretlint

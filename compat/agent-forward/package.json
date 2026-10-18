@@ -1,0 +1,40 @@
+{
+  "name": "@xtrape/agent",
+  "version": "0.8.0",
+  "description": "Forwarding package: renamed to @xtrape/connector (agent-nodejs#75, 0.8.0 concept freeze). Install @xtrape/connector instead.",
+  "license": "Apache-2.0",
+  "main": "./index.js",
+  "module": "./index.mjs",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.mjs",
+    "index.d.ts",
+    "README.md"
+  ],
+  "dependencies": {
+    "@xtrape/connector": "^0.8.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://forgejo.xtrape.com/xtrape-project/xtrape-connector-nodejs.git",
+    "directory": "compat/agent-forward"
+  },
+  "homepage": "https://forgejo.xtrape.com/xtrape-project/xtrape-connector-nodejs#readme",
+  "keywords": [
+    "xtrape",
+    "connector-sdk",
+    "forwarding",
+    "deprecated"
+  ],
+  "engines": {
+    "node": ">=24"
+  }
+}
